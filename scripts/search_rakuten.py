@@ -14,6 +14,7 @@
 import argparse
 import json
 import os
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -34,6 +35,14 @@ ENDPOINT = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/2022060
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config" / "product_keywords.yaml"
 OUTPUT_DIR = ROOT / "output"
+
+IMAGE_SIZE = "600x600"
+
+
+def _resize_image_url(url: str, size: str = IMAGE_SIZE) -> str:
+    """楽天の画像CDN(thumbnail.image.rakuten.co.jp)が提供する公式リサイズパラメータ
+    (_ex=WxH)を大きいサイズに差し替える。取得元は楽天APIのURLのまま変わらない。"""
+    return re.sub(r"_ex=\d+x\d+", f"_ex={size}", url)
 
 
 def search_items(keyword: str, hits: int = 20, min_reviews: int = 5):
@@ -68,7 +77,10 @@ def search_items(keyword: str, hits: int = 20, min_reviews: int = 5):
                 "review_count": item["reviewCount"],
                 "url": item["affiliateUrl"] or item["itemUrl"],
                 "shop": item["shopName"],
-                "image": item["mediumImageUrls"][0]["imageUrl"] if item.get("mediumImageUrls") else None,
+                "images": [
+                    _resize_image_url(entry["imageUrl"])
+                    for entry in item.get("mediumImageUrls", [])
+                ],
             }
         )
     return items
