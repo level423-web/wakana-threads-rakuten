@@ -1,0 +1,232 @@
+# wakana-threads-rakuten
+
+Threads×楽天アフィリエイトの投稿ネタを、リサーチ〜商品選定〜投稿文ドラフトまで半自動化するプロジェクト。
+
+## アカウント属性（おさく @osaku_kurashi）
+- 片付け・収納スペシャリスト／「20年汚部屋→6ヶ月で脱却」が軸のストーリー
+- 3人の子どもの母。在宅ワーク。パートナーと家事分担
+- 好んで扱う商品ジャンル：無印良品、山崎実業、収納グッズ全般、時短家電、キッチン用品
+- 文体：一人称の実体験ベース（「私の場合は〜」）。断定・否定表現は避け、やわらかく
+
+## 役割分担
+- **Claude Code**：①バズパターンのリサーチ・蓄積 ②楽天商品検索・スコアリング ③投稿文ドラフト生成
+- **わかな**：ドラフトの最終確認、アフィリエイトリンク差し込み、画像添付、実投稿
+
+## ワークフロー
+
+### ① バズパターンのリサーチ
+Threadsは公式検索APIがないため、以下を人力連携で行う：
+- わかながスクショ・URLを共有 → Claude Codeが `config/buzz_patterns.md` にパターンを言語化して追記
+- Web検索で「Threads 楽天 買ってよかった」等の話題投稿の構成（フック文・箇条書き・絵文字・ハッシュタグ数）を分析し追記
+- 新しいバズパターンを見つけたら都度 `buzz_patterns.md` を更新していく（このファイルが資産になる）
+
+### ② 楽天商品検索・選定
+`scripts/search_rakuten.py` を実行し、`config/product_keywords.yaml` のキーワードごとに商品を検索。
+スコアリング基準：
+- レビュー件数・評点が高い
+- 価格帯が中〜低（フォロワーが試しやすい）
+- 「収納」「時短」「見せる収納」など属性キーワードとの一致度
+
+結果は `output/rakuten_candidates_YYYYMMDD.json` に保存。
+
+### ③ 投稿文ドラフト生成
+①のバズパターン＋②の商品候補を組み合わせ、Threads用の短文（全角120〜200字目安）を3パターン程度生成：
+- フック文（数字・意外性・共感のいずれかで開始）
+- 箇条書き2〜4点（商品の使い方・良かった点）
+- 締めの一言＋ハッシュタグ2〜3個
+- ※アフィリエイトリンクの挿入位置だけ空欄にしておく（わかなが最終挿入）
+
+## 楽天API情報
+- APP_ID / アフィリエイトIDは `.env`（gitignore対象）で管理。コード中に直書きしない
+- 利用API: 楽天ウェブサービス IchibaItem Search API
+
+## 投稿ルール（重要）
+- 断定的な効果効能を謳わない（薬機法・景品表示法に配慮）
+- ステマ規制対応：PRやアフィリエイトを含む投稿である旨がわかる表記を必ず入れる
+- 誇張した「〇〇だけで劇的に変わる」等の表現は避け、実体験ベースの温度感を保つ
+
+# wakana-threads-rakuten
+
+Threads×楽天アフィリエイトの投稿ネタを半自動化するプロジェクト。
+詳しい役割分担・ワークフローは `CLAUDE.md` を参照。
+
+## セットアップ
+
+```bash
+cd wakana-threads-rakuten
+pip install -r scripts/requirements.txt
+cp .env.example .env
+# .env に楽天ウェブサービスのAPP_IDとアフィリエイトIDを記入
+```
+
+## 使い方
+
+```bash
+# 1商品ジャンルだけ検索
+python scripts/search_rakuten.py --keyword "山崎実業 収納" --hits 20
+
+# config/product_keywords.yaml の全キーワードをまとめて検索
+python scripts/search_rakuten.py --all
+```
+
+結果は `output/rakuten_candidates_日付.json` に保存されます。
+
+## 次にやること
+1. `config/product_keywords.yaml` を自分の投稿ジャンルに合わせて編集
+2. Threadsでバズっている投稿を見つけたら `config/buzz_patterns.md` に記録（Claude Codeに「このスクショ分析して追記して」と頼めばOK）
+3. 商品候補とバズパターンが揃ったら、Claude Codeに「この商品でThreads投稿文を3パターン作って」と依頼
+
+"""
+楽天ウェブサービス IchibaItem Search API を使って、
+おさくさんの属性キーワードにマッチする商品を検索・スコアリングする。
+
+事前準備:
+  pip install -r scripts/requirements.txt
+  .env に RAKUTEN_APP_ID / RAKUTEN_AFFILIATE_ID を設定
+
+使い方:
+  python scripts/search_rakuten.py --keyword "山崎実業 収納" --hits 20
+  python scripts/search_rakuten.py --all   # config/product_keywords.yaml の全キーワードを一括実行
+"""
+
+import argparse
+import json
+import os
+import time
+from datetime import date
+from pathlib import Path
+
+import requests
+import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
+
+RAKUTEN_APP_ID=9504be01-756d-4830-a0c2-90f4bc88c037
+RAKUTEN_AFFILIATE_ID=1eeab3a2.05784d63.1eeab3a3.87a448d9
+
+
+ENDPOINT = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT / "config" / "product_keywords.yaml"
+OUTPUT_DIR = ROOT / "output"
+
+
+def search_items(keyword: str, hits: int = 20, min_reviews: int = 5):
+    params = {
+        "applicationId": APP_ID,
+        "affiliateId": AFFILIATE_ID,
+        "keyword": keyword,
+        "hits": hits,
+        "sort": "-reviewAverage",  # レビュー評価順
+        "format": "json",
+    }
+    res = requests.get(ENDPOINT, params=params, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+
+    items = []
+    for entry in data.get("Items", []):
+        item = entry["Item"]
+        if item.get("reviewCount", 0) < min_reviews:
+            continue
+        items.append(
+            {
+                "name": item["itemName"],
+                "price": item["itemPrice"],
+                "review_avg": item["reviewAverage"],
+                "review_count": item["reviewCount"],
+                "url": item["affiliateUrl"] or item["itemUrl"],
+                "shop": item["shopName"],
+                "image": item["mediumImageUrls"][0]["imageUrl"] if item.get("mediumImageUrls") else None,
+            }
+        )
+    return items
+
+
+def score_item(item: dict) -> float:
+    # レビュー件数と評点をベースにした簡易スコア（件数は対数的に評価）
+    import math
+
+    review_weight = math.log10(item["review_count"] + 1)
+    return round(item["review_avg"] * review_weight, 3)
+
+
+def run(keyword: str, hits: int):
+    items = search_items(keyword, hits=hits)
+    for item in items:
+        item["score"] = score_item(item)
+    items.sort(key=lambda x: x["score"], reverse=True)
+    return items
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--keyword", type=str, help="検索キーワード")
+    parser.add_argument("--hits", type=int, default=20)
+    parser.add_argument("--all", action="store_true", help="config内の全キーワードを実行")
+    args = parser.parse_args()
+
+    if not APP_ID:
+        raise SystemExit("RAKUTEN_APP_ID が未設定です。.env を確認してください。")
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    results = {}
+
+    if args.all:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        for keyword in config.get("keywords", []):
+            print(f"検索中: {keyword}")
+            results[keyword] = run(keyword, args.hits)
+            time.sleep(1)  # APIレート制限対策
+    elif args.keyword:
+        results[args.keyword] = run(args.keyword, args.hits)
+    else:
+        raise SystemExit("--keyword か --all を指定してください")
+
+    out_path = OUTPUT_DIR / f"rakuten_candidates_{date.today():%Y%m%d}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"保存先: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
+# 検索したい楽天商品ジャンル・キーワード一覧
+# `python scripts/search_rakuten.py --all` で全件まとめて検索されます
+keywords:
+  - "山崎実業 収納"
+  - "無印良品 収納"
+  - "キッチン 収納 グッズ"
+  - "見せる収納"
+  - "詰め替え ボトル"
+  - "クローゼット 収納"
+  - "冷蔵庫 収納 グッズ"
+  - "洗面所 収納"
+  - "子供 おもちゃ 収納"
+  - "時短家電"
+
+# Threads×楽天アフィリ バズパターン集
+
+見つけたバズ投稿があれば、URL/スクショと一緒にここへ追記していく。
+Claude Codeへの指示例：「このスクショの投稿パターンを分析してここに追記して」
+
+## パターンの記録テンプレート
+
+### パターン名：（例：買ってよかったランキング型）
+- **フック文**：（冒頭1文。数字/意外性/共感のどれを使っているか）
+- **本文構成**：（箇条書きか、ストーリー形式か。何個くらいの項目か）
+- **絵文字の使い方**：
+- **ハッシュタグ**：（数・種類）
+- **文字数目安**：
+- **反応が良かった理由（推測）**：
+- **参考URL/スクショ**：
+
+---
+
+## 記録済みパターン
+
+（まだ記録がありません。バズ投稿を見つけたら追記してください）
